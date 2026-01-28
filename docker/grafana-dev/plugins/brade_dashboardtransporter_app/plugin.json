@@ -1,0 +1,22 @@
+{
+    "type": "app",
+    "id": "brade_dashboardtransporter_app",
+    "name": "Dashboard Transporter",
+    "version": "1.0.0",
+    "executable": "",
+    "includes": [
+        {
+            "type": "page",
+            "name": "Dashboard Transporter",
+            "path": "/a/brade-dashboardtransporter-app",
+            "role": "Admin",
+            "addToNav": true,
+            "defaultNav": true
+        }
+    ],
+    "dependencies": {
+        "grafanaVersion": ">=10.0.0",
+        "plugins": []
+    },
+    "buildMode": "production"
+}

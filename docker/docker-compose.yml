@@ -1,0 +1,88 @@
+services:
+  dashboard-transporter-backend:
+    container_name: dashboard-transporter-backend
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - GRAFANA_DEV_URL=http://grafana-dev:3000
+      - GRAFANA_DEV_USER=admin
+      - GRAFANA_DEV_PASS=admin
+
+      - GRAFANA_HML_URL=http://grafana-hml:3000
+      - GRAFANA_HML_USER=admin
+      - GRAFANA_HML_PASS=admin
+
+      - GRAFANA_PRD_URL=http://grafana-prd:3000
+      - GRAFANA_PRD_USER=admin
+      - GRAFANA_PRD_PASS=admin
+    depends_on:
+      grafana-dev:
+        condition: service_healthy
+      grafana-hml:
+        condition: service_healthy
+      grafana-prd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  grafana-dev:
+    image: grafana/grafana:11.3.0
+    container_name: grafana-dev
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+
+      # plugin unsigned
+      - GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS=brade-dashboardtransporter-app
+      - GF_PLUGIN_SIGNING_SKIP_VERIFICATION=true
+    volumes:
+      - ./grafana-dev/grafana.ini:/etc/grafana/grafana.ini:ro
+
+      # ✅ monta o DIST do plugin no caminho correto do Grafana
+      # precisa ter plugin.json + module.js dentro do dist
+      - ../plugin/brade-dashboardtransporter-app/dist:/var/lib/grafana/plugins/brade-dashboardtransporter-app:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  grafana-hml:
+    image: grafana/grafana:11.3.0
+    container_name: grafana-hml
+    ports:
+      - "3002:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana-hml/grafana.ini:/etc/grafana/grafana.ini:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  grafana-prd:
+    image: grafana/grafana:11.3.0
+    container_name: grafana-prd
+    ports:
+      - "3003:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana-prd/grafana.ini:/etc/grafana/grafana.ini:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30

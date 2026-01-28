@@ -1,0 +1,26 @@
+{
+  "type": "app",
+  "name": "Dashboard Transporter",
+  "id": "brade-dashboardtransporter-app",
+  "backend": false,
+  "info": {
+    "author": {
+      "name": "Vinicius Pessoa"
+    }
+  },
+  "includes": [
+    {
+      "type": "page",
+      "name": "Importar Dashboards",
+      "path": "import",
+      "addToNav": true
+    }
+  ],
+  "routes": [
+    {
+      "path": "api",
+      "url": "http://dashboard-transporter-backend:8080"
+    }
+  ],
+  "buildMode": "production"
+}
