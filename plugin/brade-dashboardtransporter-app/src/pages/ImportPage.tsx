@@ -1,15 +1,7 @@
 // src/pages/ImportPage.tsx
 
 import React, { useEffect, useMemo, useState } from 'react';
-import {
-  InlineField,
-  InlineFieldRow,
-  Select,
-  Button,
-  Spinner,
-  Input,
-  Alert,
-} from '@grafana/ui';
+import { InlineField, InlineFieldRow, Select, Button, Spinner, Input, Alert } from '@grafana/ui';
 import { API_ENDPOINTS } from '../constants';
 import { apiGet, apiPost, getGrafanaLoggedUser } from '../api/backend';
 
@@ -22,17 +14,45 @@ type ImportBatchPayload = {
   targetEnv: string;
   folderUid: string;
   uids: string[];
-  requestedBy?: string;
+  requestedBy?: string; // backend recebe string; vamos mandar normalizado (csv)
 };
 
-type Msg = { type: 'success' | 'error'; text: string; details?: string };
+type ImportBatchResult = {
+  sourceUid: string;
+  targetUid?: string;
+  status: 'ok' | 'warning' | 'error';
+  message?: string;
+};
+
+function normalizeRequestedBy(input: string, fallbackSingleUser: string): { csv: string; users: string[] } {
+  const raw = (input || '').trim();
+
+  // se vazio, usa user logado (comportamento atual)
+  const base = raw.length ? raw : (fallbackSingleUser || '').trim();
+  if (!base) return { csv: '', users: [] };
+
+  // aceita separadores: vírgula, ponto-e-vírgula, newline, tab
+  const parts = base
+    .split(/[,\n;\t]+/g)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  // unique (mantém ordem)
+  const seen = new Set<string>();
+  const users: string[] = [];
+  for (const p of parts) {
+    const k = p.toLowerCase();
+    if (!seen.has(k)) {
+      seen.add(k);
+      users.push(p);
+    }
+  }
+
+  return { csv: users.join(', '), users };
+}
 
 export const ImportPage = () => {
   const [loading, setLoading] = useState(false);
-
-  // carga “parcial” (pra não parecer travado/chumbado)
-  const [loadingDashboards, setLoadingDashboards] = useState(false);
-  const [loadingFolders, setLoadingFolders] = useState(false);
 
   const [environments, setEnvironments] = useState<Environment[]>([]);
   const [sourceEnv, setSourceEnv] = useState<Environment | null>(null);
@@ -47,7 +67,12 @@ export const ImportPage = () => {
   const [loggedUser, setLoggedUser] = useState<string>('');
   const [requestedBy, setRequestedBy] = useState<string>('');
 
-  const [msg, setMsg] = useState<Msg | null>(null);
+  const [msg, setMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // DEBUG: mostra o payload e a resposta do backend na tela
+  const [debugOpen, setDebugOpen] = useState<boolean>(true);
+  const [lastPayload, setLastPayload] = useState<any>(null);
+  const [lastResponse, setLastResponse] = useState<any>(null);
 
   const envOptions = useMemo(
     () => environments.map((e) => ({ label: `${e.name} (${e.id})`, value: e.id, env: e })),
@@ -83,23 +108,13 @@ export const ImportPage = () => {
     return apiGet<Folder[]>(`${API_ENDPOINTS.FOLDERS}?env=${encodeURIComponent(envId)}`);
   }
 
-  function normalizeErr(e: any): { message: string; details?: string } {
-    const message = e?.message ? String(e.message) : 'Erro desconhecido';
-    // se teu backend mandar stack/texto bruto, cai aqui
-    const details =
-      e?.stack ? String(e.stack) :
-      e?.details ? String(e.details) :
-      undefined;
-    return { message, details };
-  }
-
-  // =========================
-  // 1) Carga inicial: user + environments + defaults
-  // =========================
+  // init
   useEffect(() => {
     (async () => {
       setLoading(true);
       setMsg(null);
+      setLastPayload(null);
+      setLastResponse(null);
 
       try {
         const u = await getGrafanaLoggedUser();
@@ -108,128 +123,85 @@ export const ImportPage = () => {
         const envs = await loadEnvironments();
         setEnvironments(envs);
 
-        // defaults (mantém seu comportamento atual)
-        const dev = envs[0] || null;
-        const hml = envs[1] || null;
+        // defaults: dev/hml se existirem
+        const dev = envs.find((e) => e.id === 'dev') || envs[0] || null;
+        const hml = envs.find((e) => e.id === 'hml') || (envs.length > 1 ? envs[1] : null);
 
         setSourceEnv(dev);
         setTargetEnv(hml);
 
-        // IMPORTANTE:
-        // não carrega dashboards/pastas aqui direto,
-        // quem faz isso são os useEffects de sourceEnv/targetEnv
+        // IMPORTANTE: não “pré-carrega” dashboards/pastas fora do ambiente selecionado
+        // (vai cair nos useEffect abaixo)
       } catch (e: any) {
-        const { message, details } = normalizeErr(e);
-        setMsg({ type: 'error', text: message, details });
+        setMsg({ type: 'error', text: e?.message || 'Erro ao carregar dados iniciais' });
       } finally {
         setLoading(false);
       }
     })();
   }, []);
 
-  // =========================
-  // 2) Sempre que muda Ambiente de Origem: recarrega dashboards
-  // =========================
+  // quando muda ambiente de ORIGEM, carrega dashboards daquele env
   useEffect(() => {
-    if (!sourceEnv?.id) {
-      // se limpou seleção, limpa lista
-      setDashboards([]);
-      setSelectedUids(new Set());
-      return;
-    }
-
-    let cancelled = false;
-
+    if (!sourceEnv?.id) return;
     (async () => {
+      setLoading(true);
       setMsg(null);
-
-      // limpa estado antigo pra não parecer “chumbado”
       setDashboards([]);
       setSelectedUids(new Set());
-      setLoadingDashboards(true);
-
       try {
         const dbs = await loadDashboards(sourceEnv.id);
-        if (cancelled) return;
         setDashboards(dbs);
       } catch (e: any) {
-        if (cancelled) return;
-        const { message, details } = normalizeErr(e);
-        setMsg({
-          type: 'error',
-          text: `Erro ao carregar dashboards do ambiente "${sourceEnv.id}": ${message}`,
-          details,
-        });
+        setMsg({ type: 'error', text: e?.message || `Erro ao carregar dashboards do ambiente ${sourceEnv.id}` });
       } finally {
-        if (!cancelled) setLoadingDashboards(false);
+        setLoading(false);
       }
     })();
-
-    return () => {
-      cancelled = true;
-    };
   }, [sourceEnv?.id]);
 
-  // =========================
-  // 3) Sempre que muda Ambiente de Destino: recarrega pastas
-  // =========================
+  // quando muda ambiente de DESTINO, carrega pastas daquele env
   useEffect(() => {
-    if (!targetEnv?.id) {
-      setFolders([]);
-      setSelectedFolder(null);
-      return;
-    }
-
-    let cancelled = false;
-
+    if (!targetEnv?.id) return;
     (async () => {
+      setLoading(true);
       setMsg(null);
-
-      // limpa estado antigo
       setFolders([]);
       setSelectedFolder(null);
-      setLoadingFolders(true);
-
       try {
         const fs = await loadFolders(targetEnv.id);
-        if (cancelled) return;
-
         setFolders(fs);
-
-        // tenta “General” (uid vazio) se existir, senão primeira
-        const general = fs.find((f) => (f.uid ?? '') === '') || fs[0] || { uid: '', title: 'General' };
-        setSelectedFolder(general);
+        setSelectedFolder(fs[0] || { uid: '', title: 'General' });
       } catch (e: any) {
-        if (cancelled) return;
-        const { message, details } = normalizeErr(e);
-        setMsg({
-          type: 'error',
-          text: `Erro ao carregar pastas do ambiente "${targetEnv.id}": ${message}`,
-          details,
-        });
+        setMsg({ type: 'error', text: e?.message || `Erro ao carregar pastas do ambiente ${targetEnv.id}` });
       } finally {
-        if (!cancelled) setLoadingFolders(false);
+        setLoading(false);
       }
     })();
-
-    return () => {
-      cancelled = true;
-    };
   }, [targetEnv?.id]);
 
   async function doImport() {
     setMsg(null);
+    setLastPayload(null);
+    setLastResponse(null);
 
     if (!sourceEnv || !targetEnv) {
-      setMsg({ type: 'error', text: 'Selecione Ambiente de Origem e Ambiente de Destino.' });
+      setMsg({ type: 'error', text: 'Selecione ambiente de origem e destino.' });
       return;
     }
     if (!selectedFolder) {
-      setMsg({ type: 'error', text: 'Selecione a Pasta no Destino.' });
+      setMsg({ type: 'error', text: 'Selecione a pasta de destino.' });
       return;
     }
-    if (!selectedUids.size) {
+
+    const uids = Array.from(selectedUids);
+    if (!uids.length) {
       setMsg({ type: 'error', text: 'Selecione pelo menos 1 dashboard.' });
+      return;
+    }
+
+    const norm = normalizeRequestedBy(requestedBy, loggedUser);
+    if (!norm.users.length) {
+      setMsg({ type: 'error', text: 'requestedBy vazio e não foi possível detectar usuário logado.' });
       return;
     }
 
@@ -239,48 +211,61 @@ export const ImportPage = () => {
         sourceEnv: sourceEnv.id,
         targetEnv: targetEnv.id,
         folderUid: selectedFolder.uid ?? '',
-        uids: Array.from(selectedUids),
-        requestedBy: (requestedBy || loggedUser || '').trim() || undefined,
+        uids,
+        requestedBy: norm.csv, // manda como CSV normalizado
       };
 
-      const res = await apiPost<any>(API_ENDPOINTS.IMPORT_BATCH, payload);
-      setMsg({ type: 'success', text: res?.message || 'Importação concluída.' });
+      setLastPayload(payload);
+
+      const res = await apiPost<ImportBatchResult[]>(API_ENDPOINTS.IMPORT_BATCH, payload);
+      setLastResponse(res);
+
+      // monta mensagem rica (pra não ficar “ok” e você às cegas)
+      const summary = Array.isArray(res)
+        ? res
+            .map((r) => {
+              const m = r.message ? ` - ${r.message}` : '';
+              return `${r.sourceUid} -> ${r.targetUid || r.sourceUid}: ${r.status}${m}`;
+            })
+            .join('\n')
+        : JSON.stringify(res);
+
+      const hasError = Array.isArray(res) && res.some((r) => r.status === 'error');
+      const hasWarn = Array.isArray(res) && res.some((r) => r.status === 'warning');
+
+      setMsg({
+        type: hasError ? 'error' : 'success',
+        text:
+          (hasWarn ? 'Importação concluída com avisos.\n' : 'Importação concluída.\n') +
+          `RBAC para: ${norm.users.join(', ')}\n\n` +
+          summary,
+      });
     } catch (e: any) {
-      const { message, details } = normalizeErr(e);
-      setMsg({ type: 'error', text: message, details });
+      setMsg({ type: 'error', text: e?.message || 'Falha no import' });
     } finally {
       setLoading(false);
     }
   }
 
+  const previewUsers = useMemo(() => normalizeRequestedBy(requestedBy, loggedUser).users, [requestedBy, loggedUser]);
+
   return (
     <div style={{ padding: 16, maxWidth: 1100 }}>
       {msg && (
         <Alert severity={msg.type} title={msg.type === 'success' ? 'Sucesso' : 'Erro'}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            <div>{msg.text}</div>
-            {msg.type === 'error' && msg.details && (
-              <pre style={{ margin: 0, whiteSpace: 'pre-wrap', opacity: 0.9 }}>
-                {msg.details}
-              </pre>
-            )}
-          </div>
+          <pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{msg.text}</pre>
         </Alert>
       )}
 
       <h2>Dashboards Transporter</h2>
 
-      {/* === AMBIENTES === */}
       <InlineFieldRow style={{ marginBottom: 16 }}>
         <InlineField label="Ambiente de Origem" labelWidth={22}>
           <Select
             width={28}
             options={envOptions}
-            value={
-              sourceEnv ? { label: `${sourceEnv.name} (${sourceEnv.id})`, value: sourceEnv.id } : undefined
-            }
-            onChange={(v) => setSourceEnv(((v as any)?.env as Environment) ?? null)}
-            isClearable
+            value={sourceEnv ? { label: `${sourceEnv.name} (${sourceEnv.id})`, value: sourceEnv.id } : undefined}
+            onChange={(v) => setSourceEnv((v as any)?.env ?? null)}
           />
         </InlineField>
 
@@ -288,11 +273,8 @@ export const ImportPage = () => {
           <Select
             width={28}
             options={envOptions}
-            value={
-              targetEnv ? { label: `${targetEnv.name} (${targetEnv.id})`, value: targetEnv.id } : undefined
-            }
-            onChange={(v) => setTargetEnv(((v as any)?.env as Environment) ?? null)}
-            isClearable
+            value={targetEnv ? { label: `${targetEnv.name} (${targetEnv.id})`, value: targetEnv.id } : undefined}
+            onChange={(v) => setTargetEnv((v as any)?.env ?? null)}
           />
         </InlineField>
 
@@ -300,43 +282,42 @@ export const ImportPage = () => {
           <Select
             width={28}
             options={folderOptions}
-            value={
-              selectedFolder ? { label: selectedFolder.title || 'General', value: selectedFolder.uid } : undefined
-            }
-            onChange={(v) => setSelectedFolder(((v as any)?.folder as Folder) ?? null)}
-            isDisabled={!targetEnv || loadingFolders}
-            placeholder={!targetEnv ? 'Selecione o destino' : loadingFolders ? 'Carregando...' : 'Escolha'}
+            value={selectedFolder ? { label: selectedFolder.title || 'General', value: selectedFolder.uid } : undefined}
+            onChange={(v) => setSelectedFolder((v as any)?.folder ?? null)}
           />
         </InlineField>
       </InlineFieldRow>
 
-      {/* === USUÁRIO LOGADO (LINHA SOZINHA) === */}
       <InlineFieldRow style={{ marginBottom: 12 }}>
         <InlineField label="Usuário logado" labelWidth={22}>
           <Input value={loggedUser || 'Não identificado'} readOnly width={60} />
         </InlineField>
       </InlineFieldRow>
 
-      {/* === REQUESTED BY (LINHA SOZINHA) === */}
-      <InlineFieldRow style={{ marginBottom: 24 }}>
-        <InlineField label="requestedBy (opcional)" labelWidth={22}>
+      <InlineFieldRow style={{ marginBottom: 8 }}>
+        <InlineField label="requestedBy (múltiplos)" labelWidth={22}>
           <Input
             value={requestedBy}
             onChange={(e) => setRequestedBy(e.currentTarget.value)}
-            placeholder="(vazio = usa usuário logado)"
+            placeholder="Ex: user1@..., user2@... (se vazio = usa usuário logado)"
             width={60}
           />
         </InlineField>
       </InlineFieldRow>
 
-      {/* === DASHBOARDS === */}
-      <h3>
-        Dashboards ({dashboards.length})
-        {loadingDashboards && <span style={{ marginLeft: 10, opacity: 0.8 }}>(carregando...)</span>}
-      </h3>
+      <div style={{ marginBottom: 24, fontSize: 12, opacity: 0.9 }}>
+        <div>
+          <b>Preview RBAC:</b> {previewUsers.length ? previewUsers.join(', ') : '(nenhum)'}
+        </div>
+        <div style={{ opacity: 0.75 }}>
+          Separadores aceitos: vírgula, ponto-e-vírgula, quebra de linha.
+        </div>
+      </div>
+
+      <h3>Dashboards ({dashboards.length})</h3>
 
       <div style={{ marginBottom: 12 }}>
-        <Button size="sm" variant="secondary" onClick={selectAll} disabled={!dashboards.length || loadingDashboards}>
+        <Button size="sm" variant="secondary" onClick={selectAll} disabled={!dashboards.length}>
           Selecionar todos
         </Button>
 
@@ -345,13 +326,40 @@ export const ImportPage = () => {
           variant="primary"
           onClick={doImport}
           style={{ marginLeft: 8 }}
-          disabled={!selectedUids.size || loading || loadingDashboards || loadingFolders}
+          disabled={!selectedUids.size || loading}
         >
           Importar selecionados ({selectedUids.size})
         </Button>
+
+        <Button
+          size="sm"
+          variant="secondary"
+          onClick={() => setDebugOpen((v) => !v)}
+          style={{ marginLeft: 8 }}
+        >
+          {debugOpen ? 'Ocultar debug' : 'Mostrar debug'}
+        </Button>
       </div>
 
-      {(loading || loadingDashboards || loadingFolders) && <Spinner />}
+      {loading && <Spinner />}
+
+      {debugOpen && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 12, opacity: 0.9, marginBottom: 6 }}>
+            <b>Último payload enviado:</b>
+          </div>
+          <pre style={{ margin: 0, padding: 12, border: '1px solid #333', borderRadius: 6, overflowX: 'auto' }}>
+            {lastPayload ? JSON.stringify(lastPayload, null, 2) : '(nenhum ainda)'}
+          </pre>
+
+          <div style={{ fontSize: 12, opacity: 0.9, marginTop: 12, marginBottom: 6 }}>
+            <b>Última resposta do backend:</b>
+          </div>
+          <pre style={{ margin: 0, padding: 12, border: '1px solid #333', borderRadius: 6, overflowX: 'auto' }}>
+            {lastResponse ? JSON.stringify(lastResponse, null, 2) : '(nenhuma ainda)'}
+          </pre>
+        </div>
+      )}
 
       <table style={{ width: '100%' }}>
         <thead>
@@ -365,11 +373,7 @@ export const ImportPage = () => {
           {dashboards.map((d) => (
             <tr key={d.uid}>
               <td>
-                <input
-                  type="checkbox"
-                  checked={selectedUids.has(d.uid)}
-                  onChange={() => toggleUid(d.uid)}
-                />
+                <input type="checkbox" checked={selectedUids.has(d.uid)} onChange={() => toggleUid(d.uid)} />
               </td>
               <td>{d.title}</td>
               <td>{d.uid}</td>

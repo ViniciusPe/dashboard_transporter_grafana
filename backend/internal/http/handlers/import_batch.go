@@ -16,7 +16,7 @@ type importBatchRequest struct {
 	SourceEnv   string   `json:"sourceEnv"`
 	TargetEnv   string   `json:"targetEnv"`
 	FolderUID   string   `json:"folderUid"`
-	RequestedBy string   `json:"requestedBy"` // login/email no Grafana DESTINO
+	RequestedBy string   `json:"requestedBy"` // pode ser lista: "a,b;c\n d"
 	UIDs        []string `json:"uids"`
 }
 
@@ -45,8 +45,8 @@ type grafanaImportResp struct {
 	Status  string `json:"status"`
 	UID     string `json:"uid"`
 	Slug    string `json:"slug"`
-	ID      int    `json:"id"`      // <-- IMPORTANTISSIMO (muitas versões retornam)
-	Version int    `json:"version"` // opcional
+	ID      int    `json:"id"`
+	Version int    `json:"version"`
 }
 
 type grafanaUserLookupResp struct {
@@ -77,6 +77,37 @@ func getOrgIDFromRequest(r *http.Request) string {
 	return v
 }
 
+// aceita: "a,b; c \n d" => ["a","b","c","d"]
+func parseRequestedByList(in string) []string {
+	in = strings.TrimSpace(in)
+	if in == "" {
+		return nil
+	}
+
+	// normaliza separadores para vírgula
+	repl := strings.NewReplacer(";", ",", "\n", ",", "\r", ",", "\t", ",")
+	in = repl.Replace(in)
+
+	parts := strings.Split(in, ",")
+	out := make([]string, 0, len(parts))
+	seen := map[string]struct{}{}
+
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		key := strings.ToLower(p)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, p)
+	}
+
+	return out
+}
+
 func ImportDashboardsBatch(cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		orgID := getOrgIDFromRequest(r)
@@ -102,6 +133,7 @@ func ImportDashboardsBatch(cfg *config.Config) http.HandlerFunc {
 			return
 		}
 
+		// ✅ usa a função que já existe no package (definida em dashboards.go)
 		srcBase := stringsTrimRightSlash(src.URL)
 		dstBase := stringsTrimRightSlash(dst.URL)
 
@@ -148,7 +180,7 @@ func ImportDashboardsBatch(cfg *config.Config) http.HandlerFunc {
 				continue
 			}
 
-			// pega título (vamos usar no fallback de search)
+			// pega título (fallback de search)
 			title, _ := dashGet.Dashboard["title"].(string)
 
 			// Sanitização p/ import
@@ -196,16 +228,16 @@ func ImportDashboardsBatch(cfg *config.Config) http.HandlerFunc {
 			}
 			res.TargetUID = targetUID
 
-			// 3) RBAC: SEMPRE EDITOR (2) no DASHBOARD pro requestedBy
-			requester := strings.TrimSpace(req.RequestedBy)
-			if requester == "" {
+			// 3) RBAC: Editor (2) pro(s) requestedBy
+			requesters := parseRequestedByList(req.RequestedBy)
+			if len(requesters) == 0 {
 				res.Status = "warning"
 				res.Message = "import ok; rbac skipped (requestedBy vazio)"
 				results = append(results, res)
 				continue
 			}
 
-			// resolve dashID (prioridade: importResp.id -> GET uid meta.id -> search por title)
+			// resolve dashID
 			dashID, warn := resolveDashboardIDAfterImport(dstBase, dst.User, dst.Password, orgID, targetUID, impOut.ID, title)
 			if warn != "" {
 				res.Status = "warning"
@@ -214,7 +246,8 @@ func ImportDashboardsBatch(cfg *config.Config) http.HandlerFunc {
 				continue
 			}
 
-			warn = applyDashboardPermissionsByID(dstBase, dst.User, dst.Password, orgID, dashID, requester, 2)
+			// ✅ aplica todos os usuários em UM POST só
+			warn = applyDashboardPermissionsByIDMulti(dstBase, dst.User, dst.Password, orgID, dashID, requesters, 2)
 			if warn != "" {
 				res.Status = "warning"
 				res.Message = "import ok; rbac failed (" + warn + ")"
@@ -236,12 +269,10 @@ func ImportDashboardsBatch(cfg *config.Config) http.HandlerFunc {
 // 2) GET /api/dashboards/uid/<uid> -> meta.id
 // 3) /api/search?type=dash-db&query=<title> e casa uid
 func resolveDashboardIDAfterImport(dstBase, adminUser, adminPass, orgID, dashboardUID string, impID int, title string) (int, string) {
-	// 1) Melhor caso: Grafana retornou o ID direto no import
 	if impID > 0 {
 		return impID, ""
 	}
 
-	// 2) Tenta via GET /api/dashboards/uid/<uid>
 	getURL := dstBase + "/api/dashboards/uid/" + url.PathEscape(dashboardUID)
 	greq, _ := http.NewRequest(http.MethodGet, getURL, nil)
 	greq.SetBasicAuth(adminUser, adminPass)
@@ -268,7 +299,6 @@ func resolveDashboardIDAfterImport(dstBase, adminUser, adminPass, orgID, dashboa
 		return dashGet.Meta.ID, ""
 	}
 
-	// 3) Fallback final: search por title (porque search NÃO acha por UID)
 	title = strings.TrimSpace(title)
 	if title == "" {
 		return 0, "dash id not found (meta.id=0 and title empty)"
@@ -309,32 +339,62 @@ func resolveDashboardIDAfterImport(dstBase, adminUser, adminPass, orgID, dashboa
 	return 0, "dash id not found (meta.id=0 and search-by-title did not match uid)"
 }
 
-// aplica permissão no dashboard por ID, preservando o que já existe, e garantindo userId com permission desejada
-func applyDashboardPermissionsByID(dstBase, adminUser, adminPass, orgID string, dashID int, loginOrEmail string, permission int) string {
-	// 1) lookup user id
-	lookupURL := dstBase + "/api/users/lookup?loginOrEmail=" + url.QueryEscape(loginOrEmail)
-	lreq, _ := http.NewRequest(http.MethodGet, lookupURL, nil)
-	lreq.SetBasicAuth(adminUser, adminPass)
-	lreq.Header.Set("Accept", "application/json")
-	lreq.Header.Set("X-Grafana-Org-Id", orgID)
+// ✅ aplica permissão no dashboard por ID para VÁRIOS usuários,
+// preservando tudo que já existe e garantindo userId com permission desejada.
+// Faz 1 GET + 1 POST (não tem sobrescrita por chamada).
+func applyDashboardPermissionsByIDMulti(dstBase, adminUser, adminPass, orgID string, dashID int, loginOrEmails []string, permission int) string {
+	// 1) resolve todos os userIds
+	userIDs := make([]int, 0, len(loginOrEmails))
+	failed := make([]string, 0)
 
-	lresp, err := http.DefaultClient.Do(lreq)
-	if err != nil {
-		return "lookup: " + err.Error()
-	}
-	lbody, _ := io.ReadAll(lresp.Body)
-	_ = lresp.Body.Close()
+	seenIDs := map[int]struct{}{}
+	for _, who := range loginOrEmails {
+		who = strings.TrimSpace(who)
+		if who == "" {
+			continue
+		}
 
-	if lresp.StatusCode >= 300 {
-		return fmt.Sprintf("lookup grafana api %d: %s", lresp.StatusCode, string(lbody))
+		lookupURL := dstBase + "/api/users/lookup?loginOrEmail=" + url.QueryEscape(who)
+		lreq, _ := http.NewRequest(http.MethodGet, lookupURL, nil)
+		lreq.SetBasicAuth(adminUser, adminPass)
+		lreq.Header.Set("Accept", "application/json")
+		lreq.Header.Set("X-Grafana-Org-Id", orgID)
+
+		lresp, err := http.DefaultClient.Do(lreq)
+		if err != nil {
+			failed = append(failed, who+" (lookup err: "+err.Error()+")")
+			continue
+		}
+		lbody, _ := io.ReadAll(lresp.Body)
+		_ = lresp.Body.Close()
+
+		if lresp.StatusCode >= 300 {
+			failed = append(failed, fmt.Sprintf("%s (lookup api %d)", who, lresp.StatusCode))
+			continue
+		}
+
+		var u grafanaUserLookupResp
+		if err := json.Unmarshal(lbody, &u); err != nil {
+			failed = append(failed, who+" (lookup decode err)")
+			continue
+		}
+		if u.ID == 0 {
+			failed = append(failed, who+" (userId=0)")
+			continue
+		}
+
+		if _, ok := seenIDs[u.ID]; ok {
+			continue
+		}
+		seenIDs[u.ID] = struct{}{}
+		userIDs = append(userIDs, u.ID)
 	}
 
-	var u grafanaUserLookupResp
-	if err := json.Unmarshal(lbody, &u); err != nil {
-		return "decode lookup: " + err.Error()
-	}
-	if u.ID == 0 {
-		return "lookup returned userId=0"
+	if len(userIDs) == 0 {
+		if len(failed) > 0 {
+			return "no valid users; failed: " + strings.Join(failed, "; ")
+		}
+		return "no valid users"
 	}
 
 	// 2) GET current permissions
@@ -355,28 +415,35 @@ func applyDashboardPermissionsByID(dstBase, adminUser, adminPass, orgID string, 
 		return fmt.Sprintf("get perms grafana api %d: %s", pgresp.StatusCode, string(pgbody))
 	}
 
-	// 3) monta payload preservando entradas + garante userId
 	var current grafanaDashPermGetResp
 	_ = json.Unmarshal(pgbody, &current)
 
-	itemsOut := make([]map[string]any, 0, len(current.Permissions)+1)
+	// 3) monta payload preservando entradas + garante TODOS userIds
+	itemsOut := make([]map[string]any, 0, len(current.Permissions)+len(userIDs))
 
-	found := false
+	// set dos users que já existem no current
+	existingUser := map[int]int{}
 	for _, p := range current.Permissions {
-		if p.UserID == u.ID {
-			itemsOut = append(itemsOut, map[string]any{
-				"userId":     u.ID,
-				"permission": permission,
-			})
-			found = true
-			continue
-		}
-
 		if p.UserID != 0 {
-			itemsOut = append(itemsOut, map[string]any{
-				"userId":     p.UserID,
-				"permission": p.Permission,
-			})
+			existingUser[p.UserID] = p.Permission
+		}
+	}
+
+	// preserva tudo que já existe (users/teams/roles)
+	for _, p := range current.Permissions {
+		if p.UserID != 0 {
+			// se for um dos users alvo, força permission desejada
+			if _, ok := seenIDs[p.UserID]; ok {
+				itemsOut = append(itemsOut, map[string]any{
+					"userId":     p.UserID,
+					"permission": permission,
+				})
+			} else {
+				itemsOut = append(itemsOut, map[string]any{
+					"userId":     p.UserID,
+					"permission": p.Permission,
+				})
+			}
 			continue
 		}
 		if p.TeamID != 0 {
@@ -395,9 +462,13 @@ func applyDashboardPermissionsByID(dstBase, adminUser, adminPass, orgID string, 
 		}
 	}
 
-	if !found {
+	// adiciona os users alvo que ainda não existiam
+	for _, id := range userIDs {
+		if _, ok := existingUser[id]; ok {
+			continue
+		}
 		itemsOut = append(itemsOut, map[string]any{
-			"userId":     u.ID,
+			"userId":     id,
 			"permission": permission,
 		})
 	}
@@ -405,7 +476,7 @@ func applyDashboardPermissionsByID(dstBase, adminUser, adminPass, orgID string, 
 	payload := map[string]any{"items": itemsOut}
 	b, _ := json.Marshal(payload)
 
-	// 4) POST permissions
+	// 4) POST permissions (1 vez)
 	ppreq, _ := http.NewRequest(http.MethodPost, permURL, bytes.NewReader(b))
 	ppreq.SetBasicAuth(adminUser, adminPass)
 	ppreq.Header.Set("Content-Type", "application/json")
@@ -421,6 +492,11 @@ func applyDashboardPermissionsByID(dstBase, adminUser, adminPass, orgID string, 
 
 	if ppresp.StatusCode >= 300 {
 		return fmt.Sprintf("post perms grafana api %d: %s", ppresp.StatusCode, string(ppbody))
+	}
+
+	// se alguns falharam no lookup, retorna warning (mas não falha tudo)
+	if len(failed) > 0 {
+		return "some users failed lookup: " + strings.Join(failed, "; ")
 	}
 
 	return ""

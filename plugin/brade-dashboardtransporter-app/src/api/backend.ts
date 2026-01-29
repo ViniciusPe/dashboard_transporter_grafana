@@ -5,12 +5,6 @@ import { API_ENDPOINTS, getBackendCandidates } from '../constants';
 
 let cachedBaseUrl: string | null = null;
 
-type GrafanaUserCtx = {
-  login: string;
-  email: string;
-  orgId: number;
-};
-
 async function resolveBackendBaseUrl(): Promise<string> {
   if (cachedBaseUrl) {
     return cachedBaseUrl;
@@ -34,16 +28,14 @@ async function resolveBackendBaseUrl(): Promise<string> {
   throw new Error(`Backend não encontrado. Testei: ${candidates.join(', ')}`);
 }
 
-export async function getGrafanaUserCtx(): Promise<GrafanaUserCtx> {
+function stringifyErrorBody(text: string): string {
+  // tenta JSON -> pega message
   try {
-    const u = await getBackendSrv().get('/api/user');
-    return {
-      login: (u?.login || '').toString(),
-      email: (u?.email || '').toString(),
-      orgId: Number(u?.orgId || 1),
-    };
+    const j = JSON.parse(text);
+    if (j?.message) return String(j.message);
+    return JSON.stringify(j);
   } catch {
-    return { login: '', email: '', orgId: 1 };
+    return text;
   }
 }
 
@@ -52,19 +44,14 @@ export async function apiGet<T>(path: string): Promise<T> {
   const clean = path.startsWith('/') ? path : `/${path}`;
   const url = `${base}${clean}`;
 
-  const ctx = await getGrafanaUserCtx();
-
-  const res = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'X-Grafana-Org-Id': String(ctx.orgId || 1),
-    },
-  });
-
+  const res = await fetch(url, { method: 'GET' });
   const text = await res.text();
+
   if (!res.ok) {
-    throw new Error(`GET ${url} -> ${res.status}: ${text}`);
+    const body = stringifyErrorBody(text);
+    throw new Error(`GET ${url} -> ${res.status}: ${body}`);
   }
+
   return JSON.parse(text) as T;
 }
 
@@ -73,26 +60,28 @@ export async function apiPost<T>(path: string, body: any): Promise<T> {
   const clean = path.startsWith('/') ? path : `/${path}`;
   const url = `${base}${clean}`;
 
-  const ctx = await getGrafanaUserCtx();
-
   const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Grafana-Org-Id': String(ctx.orgId || 1),
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 
   const text = await res.text();
+
   if (!res.ok) {
-    throw new Error(`POST ${url} -> ${res.status}: ${text}`);
+    const bodyText = stringifyErrorBody(text);
+    throw new Error(`POST ${url} -> ${res.status}: ${bodyText}`);
   }
+
   return text ? (JSON.parse(text) as T) : ({} as T);
 }
 
-// Mantém compatível com teu ImportPage
+// pega user logado (Viewer também)
 export async function getGrafanaLoggedUser(): Promise<string> {
-  const ctx = await getGrafanaUserCtx();
-  return (ctx.login || ctx.email || '').toString();
+  try {
+    const u = await getBackendSrv().get('/api/user');
+    return (u?.login || u?.email || '').toString();
+  } catch {
+    return '';
+  }
 }
