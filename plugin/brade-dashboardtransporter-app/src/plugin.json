@@ -19,7 +19,7 @@
   "routes": [
     {
       "path": "api",
-      "url": "http://dashboard-transporter-backend:8080"
+      "url": "https://grafana-dashboard-exporter-route-nm-observ.apps.arodvplattedi11.arocorpp.bradesco.com.br"
     }
   ],
   "buildMode": "production"

@@ -25,7 +25,7 @@ export function getBackendCandidates(): string[] {
   const candidates = [
     fromWindow,
     '/dashboard-transporter',
-    'http://localhost:8080',
+    'https://grafana-dashboard-exporter-route-nm-observ.apps.arodvplattedi11.arocorpp.bradesco.com.br',
   ].filter(Boolean);
 
   return candidates.map((c) => c.replace(/\/+$/, ''));
