@@ -153,7 +153,7 @@ const config = async (env: Env): Promise<Configuration> => {
 
     output: {
       clean: {
-        keep: new RegExp(`(.*?_(amd64|arm(64)?)(.exe)?|go_plugin_build_manifest)`),
+        keep: new RegExp(`(.*?_(amd64|arm(64)?)(.exe)?|go_plugin_build_manifest|\\.gitkeep)`),
       },
       filename: '[name].js',
       chunkFilename: env.production ? '[name].js?_cache=[contenthash]' : '[name].js',
